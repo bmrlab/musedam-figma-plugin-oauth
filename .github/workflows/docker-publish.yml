@@ -58,7 +58,7 @@ jobs:
   push-aws:
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     env:
       VERSION: ${{ needs.build.outputs.version }}
     steps:
