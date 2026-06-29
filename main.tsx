@@ -5,7 +5,7 @@ import type { Context } from 'hono'
 import { logError, logInfo, logSuccess, logWarning } from './utils.ts'
 import { PluginAuthPage } from './components/PluginAuthPage.tsx'
 import { AuthSuccessPage } from './components/AuthSuccessPage.tsx'
-import {env} from "./env.ts";
+import { env } from './env.ts'
 
 const app = new Hono()
 
@@ -36,6 +36,8 @@ const state2code = new Map()
 const state2resolver = new Map()
 // 存储状态和语言的映射
 const state2lng = new Map()
+// state -> app mapping (figma default / ps); mirrors state2lng
+const state2app = new Map()
 
 logInfo('OAuth 状态存储已初始化', {
 	state2code: 'Map for storing state-to-code mappings',
@@ -57,6 +59,7 @@ app.get('/plugin', (c: Context) => {
 
 	const state = c.req.query('state')
 	const lng = c.req.query('lng')
+	const appParam = c.req.query('app') ?? 'figma'
 
 	logInfo(`lng: ${lng}`)
 
@@ -70,6 +73,7 @@ app.get('/plugin', (c: Context) => {
 			state2lng.set(state, lng)
 			logInfo('已存储 state 和 lng 的映射', { state, lng })
 		}
+		state2app.set(state, appParam)
 	}
 
 	logSuccess('插件授权页面已生成', {
@@ -89,6 +93,7 @@ app.get('/write', (c: Context) => {
 
 	// 根据 state 获取对应的 lng
 	const lng = state ? state2lng.get(state) : undefined
+	const appParam = state ? state2app.get(state) : undefined
 
 	logInfo('接收到授权参数', { state, code: code ? '***' : undefined, lng })
 
@@ -120,7 +125,7 @@ app.get('/write', (c: Context) => {
 		lng,
 	})
 
-	return c.html(<AuthSuccessPage lng={lng} />)
+	return c.html(<AuthSuccessPage lng={lng} app={appParam} />)
 })
 
 // 读取代码的路由
