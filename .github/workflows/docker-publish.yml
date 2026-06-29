@@ -1,83 +1,180 @@
-name: Build and Push Docker Image
+name: Build and Push OAuth Docker Image
 
 on:
-  # 当代码推送到 main 分支时触发
   push:
-    branches:
-      - main
-  # 支持手动触发
+    tags:
+      - 'v*'
   workflow_dispatch:
-
-env:
-  # 使用 ghcr.io 作为容器镜像仓库
-  REGISTRY: ghcr.io
-  # 镜像名称基于仓库名称（会自动转换为小写）
-  IMAGE_NAME: ${{ github.repository }}
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.0.0)'
+        required: true
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
-    # 设置权限以允许推送到 GitHub Container Registry
+    timeout-minutes: 30
     permissions:
       contents: read
-      packages: write
-      id-token: write
-
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
     steps:
-      - name: 检出代码
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: 设置 Docker Buildx
+      - name: Get version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: 登录到 GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 提取 Docker 元数据
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            # 为 main 分支设置 latest 标签
-            type=raw,value=latest,enable={{is_default_branch}}
-            # 基于 git commit SHA 的标签
-            type=sha,prefix={{branch}}-,format=short
-            # 基于 git commit SHA 的完整标签
-            type=sha,format=long
-            # 基于分支名称的标签
-            type=ref,event=branch
-            # 基于日期的标签
-            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
-
-      - name: 构建并推送 Docker 镜像
-        uses: docker/build-push-action@v5
+      - name: Build Docker image
+        uses: docker/build-push-action@v4
+        timeout-minutes: 20
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # 启用缓存以加快构建速度
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # 构建多平台镜像（可选，如果只需要 linux/amd64 可以删除此行）
-          platforms: linux/amd64,linux/arm64
+          push: false
+          load: true
+          tags: musedam-figma-plugin-oauth:local
 
-      - name: 输出镜像信息
+      - name: Save Docker image
+        run: docker save musedam-figma-plugin-oauth:local | gzip > /tmp/image.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar.gz
+          retention-days: 1
+
+  push-aws:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: gunzip -c /tmp/image.tar.gz | docker load
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: musecr.azurecr.cn
+          username: ${{ secrets.AZURE_REGISTRY_USERNAME }}
+          password: ${{ secrets.AZURE_REGISTRY_PASSWORD }}
+
+      - name: Push to Azure Container Registry
         run: |
-          echo "### 🐳 Docker 镜像构建成功！" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**镜像标签：**" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**拉取镜像命令：**" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          docker tag musedam-figma-plugin-oauth:local musecr.azurecr.cn/muse/musedam-figma-plugin-oauth:${{ env.VERSION }}
+          docker tag musedam-figma-plugin-oauth:local musecr.azurecr.cn/muse/musedam-figma-plugin-oauth:latest
+          docker push musecr.azurecr.cn/muse/musedam-figma-plugin-oauth:${{ env.VERSION }}
+          docker push musecr.azurecr.cn/muse/musedam-figma-plugin-oauth:latest
 
+      - name: Setup Kubernetes Config And Update Deployment
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_MUSE_CLUSTER }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          export KUBECONFIG=$HOME/.kube/config
+          kubectl config use-context muse-aws-us-prod
+          kubectl set image deployment/musedam-figma-plugin-oauth musedam-figma-plugin-oauth=musecr.azurecr.cn/muse/musedam-figma-plugin-oauth:${{ env.VERSION }} --namespace musedam
+
+  push-ghcr:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: gunzip -c /tmp/image.tar.gz | docker load
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GitHub Container Registry
+        run: |
+          docker tag musedam-figma-plugin-oauth:local ghcr.io/${{ github.repository_owner }}/musedam-figma-plugin-oauth:${{ env.VERSION }}
+          docker tag musedam-figma-plugin-oauth:local ghcr.io/${{ github.repository_owner }}/musedam-figma-plugin-oauth:latest
+          docker push ghcr.io/${{ github.repository_owner }}/musedam-figma-plugin-oauth:${{ env.VERSION }}
+          docker push ghcr.io/${{ github.repository_owner }}/musedam-figma-plugin-oauth:latest
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG
+        id: changelog
+        run: |
+          VERSION_NO_V="${VERSION#v}"
+          if [ ! -f CHANGELOG.md ]; then
+            echo "CHANGELOG.md not found; will fall back to auto-generated notes"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          awk -v ver="$VERSION_NO_V" '
+            /^## / {
+              if (match($0, "^## \\[?" ver "\\]?")) { in_section = 1; next }
+              if (in_section) exit
+            }
+            in_section { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+          # Trim leading/trailing blank lines
+          sed -i -e '/./,$!d' -e ':a' -e '/^\n*$/{$d;N;ba' -e '}' /tmp/release-notes.md || true
+          if [ -s /tmp/release-notes.md ]; then
+            echo "Found CHANGELOG entry for v$VERSION_NO_V"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No CHANGELOG entry for v$VERSION_NO_V; will fall back to auto-generated notes"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release (from CHANGELOG)
+        if: steps.changelog.outputs.found == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          body_path: /tmp/release-notes.md
+
+      - name: Create GitHub Release (fallback to auto notes)
+        if: steps.changelog.outputs.found != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          generate_release_notes: true
